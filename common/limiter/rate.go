@@ -31,3 +31,26 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	w.limiter.WaitN(ctx, int(mb.Len()))
 	return w.writer.WriteMultiBuffer(mb)
 }
+
+// Reader limits the uplink of a link passed to DispatchLink, which has no
+// pipe writer to wrap with RateWriter.
+type Reader struct {
+	reader  buf.Reader
+	limiter *rate.Limiter
+}
+
+func (l *Limiter) RateReader(reader buf.Reader, limiter *rate.Limiter) buf.Reader {
+	return &Reader{
+		reader:  reader,
+		limiter: limiter,
+	}
+}
+
+func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.reader.ReadMultiBuffer()
+	if !mb.IsEmpty() {
+		ctx := context.Background()
+		r.limiter.WaitN(ctx, int(mb.Len()))
+	}
+	return mb, err
+}

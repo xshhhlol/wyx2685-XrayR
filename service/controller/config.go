@@ -17,7 +17,7 @@ type Config struct {
 	DisableGetRule            bool                             `mapstructure:"DisableGetRule"`
 	EnableProxyProtocol       bool                             `mapstructure:"EnableProxyProtocol"`
 	EnableFallback            bool                             `mapstructure:"EnableFallback"`
-	DisableIVCheck            bool                             `mapstructure:"DisableIVCheck"`
+	DisableIVCheck            bool                             `mapstructure:"DisableIVCheck"` // No effect: Xray-core removed the Shadowsocks IV check
 	DisableSniffing           bool                             `mapstructure:"DisableSniffing"`
 	AutoSpeedLimitConfig      *AutoSpeedLimitConfig            `mapstructure:"AutoSpeedLimitConfig"`
 	GlobalDeviceLimitConfig   *limiter.GlobalDeviceLimitConfig `mapstructure:"GlobalDeviceLimitConfig"`

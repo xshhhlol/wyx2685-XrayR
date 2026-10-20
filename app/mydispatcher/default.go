@@ -5,6 +5,7 @@ package mydispatcher
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -35,27 +36,25 @@ var errSniffingTimeout = newError("timeout on sniffing")
 
 type cachedReader struct {
 	sync.Mutex
-	reader *pipe.Reader
+	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
 	cache  buf.MultiBuffer
 }
 
-func (r *cachedReader) Cache(b *buf.Buffer) {
-	mb, _ := r.reader.ReadMultiBufferTimeout(time.Millisecond * 100)
+func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
+	mb, err := r.reader.ReadMultiBufferTimeout(deadline)
+	if err != nil {
+		return err
+	}
 	r.Lock()
 	if !mb.IsEmpty() {
 		r.cache, _ = buf.MergeMulti(r.cache, mb)
 	}
-	cacheLen := r.cache.Len()
-	if cacheLen <= b.Cap() {
-		b.Clear()
-	} else {
-		b.Release()
-		*b = *buf.NewWithSize(cacheLen)
-	}
-	rawBytes := b.Extend(cacheLen)
+	b.Clear()
+	rawBytes := b.Extend(min(r.cache.Len(), b.Cap()))
 	n := r.cache.Copy(rawBytes)
 	b.Resize(0, int32(n))
 	r.Unlock()
+	return nil
 }
 
 func (r *cachedReader) readInternal() buf.MultiBuffer {
@@ -95,7 +94,9 @@ func (r *cachedReader) Interrupt() {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	r.reader.Interrupt()
+	if p, ok := r.reader.(*pipe.Reader); ok {
+		p.Interrupt()
+	}
 }
 
 // DefaultDispatcher is a default implementation of Dispatcher.
@@ -214,11 +215,54 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	return inboundLink, outboundLink, nil
 }
 
+// wrapLink applies the device limit, speed limit and user stats to a link
+// passed to DispatchLink, as getLink does for Dispatch.
+func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) (*transport.Link, error) {
+	sessionInbound := session.InboundFromContext(ctx)
+	var user *protocol.MemoryUser
+	if sessionInbound != nil {
+		user = sessionInbound.User
+		sessionInbound.CanSpliceCopy = 3
+	}
+
+	if user != nil && len(user.Email) > 0 {
+		// Speed Limit and Device Limit
+		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String(), sessionInbound.Source.Network == net.Network_TCP)
+		if reject {
+			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
+			common.Close(link.Writer)
+			common.Interrupt(link.Reader)
+			return nil, newError("Devices reach the limit: ", user.Email)
+		}
+		if ok {
+			link.Reader = d.Limiter.RateReader(link.Reader, bucket)
+			link.Writer = d.Limiter.RateWriter(link.Writer, bucket)
+		}
+	}
+
+	return dispatcher.WrapLink(ctx, d.policy, d.stats, link), nil
+}
+
 func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) bool {
 	domain := result.Domain()
+	if domain == "" {
+		return false
+	}
 	for _, d := range request.ExcludeForDomain {
-		if strings.ToLower(domain) == d {
-			return false
+		if strings.HasPrefix(d, "regexp:") {
+			pattern := d[7:]
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				errors.LogInfo(ctx, "Unable to compile regex")
+				continue
+			}
+			if re.MatchString(domain) {
+				return false
+			}
+		} else {
+			if strings.ToLower(domain) == d {
+				return false
+			}
 		}
 	}
 	protocolString := result.Protocol()
@@ -322,46 +366,49 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
 	}
+	// Inbounds close the connection when DispatchLink returns, so dispatch synchronously.
+	outbound, err := d.wrapLink(ctx, outbound)
+	if err != nil {
+		return err
+	}
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
+		d.routedDispatch(ctx, outbound, destination)
 	} else {
-		go func() {
-			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
+		cReader := &cachedReader{
+			reader: outbound.Reader.(buf.TimeoutReader),
+		}
+		outbound.Reader = cReader
+		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		if err == nil {
+			content.Protocol = result.Protocol()
+		}
+		if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+			domain := result.Domain()
+			errors.LogInfo(ctx, "sniffed domain: ", domain)
+			destination.Address = net.ParseAddress(domain)
+			protocol := result.Protocol()
+			if resComp, ok := result.(SnifferResultComposite); ok {
+				protocol = resComp.ProtocolForDomainResult()
 			}
-			outbound.Reader = cReader
-			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-			if err == nil {
-				content.Protocol = result.Protocol()
+			isFakeIP := false
+			if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
+				isFakeIP = true
 			}
-			if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
-				domain := result.Domain()
-				errors.LogInfo(ctx, "sniffed domain: ", domain)
-				destination.Address = net.ParseAddress(domain)
-				protocol := result.Protocol()
-				if resComp, ok := result.(SnifferResultComposite); ok {
-					protocol = resComp.ProtocolForDomainResult()
-				}
-				isFakeIP := false
-				if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
-					isFakeIP = true
-				}
-				if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
-					ob.RouteTarget = destination
-				} else {
-					ob.Target = destination
-				}
+			if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
+				ob.RouteTarget = destination
+			} else {
+				ob.Target = destination
 			}
-			d.routedDispatch(ctx, outbound, destination)
-		}()
+		}
+		d.routedDispatch(ctx, outbound, destination)
 	}
 
 	return nil
 }
 
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
-	payload := buf.New()
+	payload := buf.NewWithSize(32767)
 	defer payload.Release()
 
 	sniffer := NewSniffer(ctx)
@@ -373,26 +420,36 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 	}
 
 	contentResult, contentErr := func() (SniffResult, error) {
+		cacheDeadline := 200 * time.Millisecond
 		totalAttempt := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			default:
-				totalAttempt++
-				if totalAttempt > 2 {
-					return nil, errSniffingTimeout
+				cachingStartingTimeStamp := time.Now()
+				err := cReader.Cache(payload, cacheDeadline)
+				if err != nil {
+					return nil, err
 				}
+				cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
+				cacheDeadline -= cachingTimeElapsed
 
-				cReader.Cache(payload)
 				if !payload.IsEmpty() {
 					result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
-					if err != common.ErrNoClue {
+					switch err {
+					case common.ErrNoClue: // No Clue: protocol not matches, and sniffer cannot determine whether there will be a match or not
+						totalAttempt++
+					case protocol.ErrProtoNeedMoreData: // Protocol Need More Data: protocol matches, but need more data to complete sniffing
+						// in this case, do not add totalAttempt(allow to read until timeout)
+					default:
 						return result, err
 					}
+				} else {
+					totalAttempt++
 				}
-				if payload.IsFull() {
-					return nil, errUnknownContent
+				if totalAttempt >= 2 || cacheDeadline <= 0 {
+					return nil, errSniffingTimeout
 				}
 			}
 		}
@@ -409,18 +466,6 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
-	if hosts, ok := d.dns.(dns.HostsLookup); ok && destination.Address.Family().IsDomain() {
-		proxied := hosts.LookupHosts(ob.Target.String())
-		if proxied != nil {
-			ro := ob.RouteTarget == destination
-			destination.Address = *proxied
-			if ro {
-				ob.RouteTarget = destination
-			} else {
-				ob.Target = destination
-			}
-		}
-	}
 
 	var handler outbound.Handler
 
